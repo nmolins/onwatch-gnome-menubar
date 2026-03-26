@@ -4,6 +4,8 @@ GNOME Shell extension to monitor Claude Code usage from the top bar, powered by 
 
 ![GNOME Shell 45+](https://img.shields.io/badge/GNOME_Shell-45%2B-blue)
 
+![Screenshot](screenshot.png)
+
 ## Features
 
 - Displays current quota utilization in the top bar (e.g. `12%`)
