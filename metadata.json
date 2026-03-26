@@ -1,0 +1,7 @@
+{
+  "name": "OnWatch",
+  "description": "Monitor Claude Code usage from the GNOME top bar via onWatch",
+  "uuid": "onwatch@onllm.dev",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": "https://github.com/onllm-dev/onwatch"
+}
