@@ -33,18 +33,26 @@
 .onwatch-bar-fill {
   height: 8px;
   border-radius: 4px;
+  /* Color is applied inline via a continuous gradient (see extension.js). */
 }
 
-.onwatch-bar-healthy {
-  background-color: #4caf50;
+.onwatch-spark-row {
+  margin-top: 10px;
 }
 
-.onwatch-bar-elevated {
-  background-color: #ff9800;
+.onwatch-spark-area {
+  margin-top: 4px;
+  border-radius: 4px;
+  background-color: rgba(255, 255, 255, 0.06);
 }
 
-.onwatch-bar-critical {
-  background-color: #f44336;
+.onwatch-peak-banner {
+  font-size: 11px;
+  color: #ffca28;
+  background-color: rgba(255, 202, 40, 0.12);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 10px;
 }
 
 .onwatch-error {
