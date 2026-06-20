@@ -14,6 +14,15 @@ const API_URL = `${ONWATCH_URL}/api/current`;
 const HISTORY_URL = `${ONWATCH_URL}/api/history`;
 const POLL_SECONDS = 60;
 
+// OpenRouter exposes a real prepaid credit balance via this endpoint
+// (remaining = total_credits − total_usage). Anthropic has no equivalent
+// "remaining balance" endpoint, so we only surface OpenRouter here.
+const OPENROUTER_CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
+
+// Per-day, per-(model,endpoint) activity for the last 30 completed UTC days.
+// We aggregate it into a daily-spend histogram.
+const OPENROUTER_ACTIVITY_URL = 'https://openrouter.ai/api/v1/activity';
+
 // How many trailing history points to render in the sparkline.
 const SPARKLINE_POINTS = 48;
 
@@ -61,15 +70,20 @@ class OnWatchIndicator extends PanelMenu.Button {
             if (!ok) return null;
 
             const text = new TextDecoder().decode(contents);
-            let user = '', pass = '';
+            let user = '', pass = '', openRouterKey = '';
             for (const line of text.split('\n')) {
                 const trimmed = line.trim();
                 if (trimmed.startsWith('ONWATCH_ADMIN_USER='))
                     user = trimmed.split('=', 2)[1];
                 if (trimmed.startsWith('ONWATCH_ADMIN_PASS='))
                     pass = trimmed.split('=', 2)[1];
+                if (trimmed.startsWith('OPENROUTER_API_KEY='))
+                    openRouterKey = trimmed.split('=', 2)[1];
             }
-            if (user && pass) return { user, pass };
+            // The onWatch basic-auth pair and the OpenRouter key are
+            // independent: either may be present without the other.
+            if ((user && pass) || openRouterKey)
+                return { user, pass, openRouterKey };
         } catch (e) {
             log(`[OnWatch] Failed to load credentials: ${e.message}`);
         }
@@ -119,22 +133,98 @@ class OnWatchIndicator extends PanelMenu.Button {
     }
 
     _refresh() {
-        // Fetch current usage and history in parallel; history is best-effort.
+        // Fetch current usage and history in parallel; both history and the
+        // OpenRouter balance are best-effort (null on failure / missing key).
         Promise.all([
             this._fetchJson(API_URL),
             this._fetchJson(HISTORY_URL).catch(() => null),
+            this._fetchOpenRouterCredits().catch(() => null),
+            this._fetchOpenRouterActivity().catch(() => null),
         ])
-            .then(([data, history]) => this._updateUI(data, history))
+            .then(([data, history, credits, activity]) =>
+                this._updateUI(data, history, credits, activity))
             .catch(e => this._showError(e.message));
     }
 
-    // Fetch and parse JSON from an onWatch endpoint via curl (GJS has no Soup
-    // bundled reliably across shell versions, so we shell out).
-    async _fetchJson(url) {
+    // Fetch OpenRouter's prepaid credit balance. Returns { remaining, total,
+    // usage } in USD, or null if no key is configured. Uses a Bearer header
+    // (not the onWatch basic-auth pair).
+    async _fetchOpenRouterCredits() {
+        const key = this._credentials?.openRouterKey;
+        if (!key) return null;
+
+        const data = await this._fetchJson(OPENROUTER_CREDITS_URL, {
+            authHeader: `Authorization: Bearer ${key}`,
+        });
+        const total = Number(data?.data?.total_credits);
+        const usage = Number(data?.data?.total_usage);
+        if (!Number.isFinite(total) || !Number.isFinite(usage)) return null;
+        return { remaining: total - usage, total, usage };
+    }
+
+    // Fetch OpenRouter's 30-day activity and collapse it into a per-day spend
+    // series suitable for a histogram. The raw endpoint returns one row per
+    // (date, model, endpoint), so we sum `usage` (USD) by date. Returns a
+    // chronologically-sorted array of { date, spend }, or null if unavailable.
+    async _fetchOpenRouterActivity() {
+        const key = this._credentials?.openRouterKey;
+        if (!key) return null;
+
+        const data = await this._fetchJson(OPENROUTER_ACTIVITY_URL, {
+            authHeader: `Authorization: Bearer ${key}`,
+        });
+        const rows = data?.data;
+        if (!Array.isArray(rows) || rows.length === 0) return null;
+
+        const byDate = new Map();
+        for (const r of rows) {
+            // `date` comes as "YYYY-MM-DD HH:MM:SS"; keep just the day part.
+            const date = typeof r?.date === 'string' ? r.date.slice(0, 10) : null;
+            const spend = Number(r?.usage);
+            if (!date || !Number.isFinite(spend)) continue;
+            byDate.set(date, (byDate.get(date) ?? 0) + spend);
+        }
+        if (byDate.size === 0) return null;
+
+        // The API only returns days that had activity, so the series is sparse.
+        // Fill the gaps with $0 across a continuous span from the earliest
+        // active day up to (and including) today, so the histogram's X axis is
+        // proportional to real time instead of collapsing idle days together.
+        const days = [...byDate.keys()].sort();
+        const start = days[0];
+        const today = this._todayUtcDate();
+        const end = today > days[days.length - 1] ? today : days[days.length - 1];
+
+        const series = [];
+        for (let d = start; d <= end; d = this._nextUtcDate(d)) {
+            series.push({ date: d, spend: byDate.get(d) ?? 0 });
+            if (series.length >= 366) break; // safety: never loop unbounded
+        }
+        return series;
+    }
+
+    // Today's date as a UTC "YYYY-MM-DD" string (OpenRouter dates are UTC).
+    _todayUtcDate() {
+        return new Date().toISOString().slice(0, 10);
+    }
+
+    // Given a "YYYY-MM-DD" string, return the next calendar day, UTC-safe.
+    _nextUtcDate(dateStr) {
+        const t = Date.parse(`${dateStr}T00:00:00Z`) + 86400000;
+        return new Date(t).toISOString().slice(0, 10);
+    }
+
+    // Fetch and parse JSON via curl (GJS has no Soup bundled reliably across
+    // shell versions, so we shell out). By default uses the onWatch basic-auth
+    // pair; pass { authHeader } to send an explicit Authorization header
+    // instead (e.g. for third-party APIs like OpenRouter).
+    async _fetchJson(url, { authHeader } = {}) {
         return new Promise((resolve, reject) => {
-            const argv = ['curl', '-s', '--max-time', '10', '-u',
-                `${this._credentials?.user ?? ''}:${this._credentials?.pass ?? ''}`,
-                url];
+            const argv = authHeader
+                ? ['curl', '-s', '--max-time', '10', '-H', authHeader, url]
+                : ['curl', '-s', '--max-time', '10', '-u',
+                    `${this._credentials?.user ?? ''}:${this._credentials?.pass ?? ''}`,
+                    url];
 
             try {
                 const proc = Gio.Subprocess.new(
@@ -167,12 +257,18 @@ class OnWatchIndicator extends PanelMenu.Button {
         });
     }
 
-    _updateUI(data, history) {
+    _updateUI(data, history, credits, activity) {
         // Remove old quota rows
         this._quotaContainer.destroy_all_children();
 
         if (!data || !data.quotas || data.quotas.length === 0) {
             this._panelLabel.set_text('--');
+            // Even when onWatch has no quota data, still surface the API
+            // credit balance and spend chart if we have them.
+            const balance = this._buildCreditRow(credits);
+            if (balance) this._quotaContainer.add_child(balance);
+            const chart = this._buildSpendChart(activity);
+            if (chart) this._quotaContainer.add_child(chart);
             return;
         }
 
@@ -199,6 +295,15 @@ class OnWatchIndicator extends PanelMenu.Button {
             const row = this._buildQuotaRow(quota);
             this._quotaContainer.add_child(row);
         }
+
+        // OpenRouter prepaid credit balance (best-effort; only if a key is
+        // configured and the request succeeded).
+        const balance = this._buildCreditRow(credits);
+        if (balance) this._quotaContainer.add_child(balance);
+
+        // OpenRouter daily-spend histogram over the last 30 days.
+        const chart = this._buildSpendChart(activity);
+        if (chart) this._quotaContainer.add_child(chart);
 
         // History sparkline (5-hour and weekly trends over time).
         const spark = this._buildSparkline(history);
@@ -437,6 +542,150 @@ class OnWatchIndicator extends PanelMenu.Button {
         }
 
         return row;
+    }
+
+    // Build the OpenRouter credit balance row: remaining $ headline plus a
+    // "used $X of $Y" sub-line. Returns null if no credit data is available.
+    _buildCreditRow(credits) {
+        if (!credits) return null;
+
+        const row = new St.BoxLayout({
+            vertical: true,
+            style_class: 'onwatch-quota-row onwatch-credit-row',
+        });
+
+        const labelBox = new St.BoxLayout();
+        labelBox.add_child(new St.Label({
+            text: 'Crédit OpenRouter',
+            style_class: 'onwatch-quota-label',
+            x_expand: true,
+        }));
+        labelBox.add_child(new St.Label({
+            text: this._formatUsd(credits.remaining),
+            style_class: 'onwatch-quota-label',
+            // Warn (amber) under $5, alert (red) under $1, else neutral green.
+            style: `color: ${this._creditColor(credits.remaining)}; font-weight: bold;`,
+        }));
+        row.add_child(labelBox);
+
+        row.add_child(new St.Label({
+            text: `Utilisé ${this._formatUsd(credits.usage)} sur ${this._formatUsd(credits.total)}`,
+            style_class: 'onwatch-quota-sublabel',
+        }));
+
+        return row;
+    }
+
+    // Format a USD amount: $12.34, or $12.3k for large balances. Keeps two
+    // decimals for small amounts so a near-empty balance stays legible.
+    _formatUsd(amount) {
+        const v = Number(amount) || 0;
+        if (Math.abs(v) >= 1000)
+            return `$${(v / 1000).toFixed(1)}k`;
+        return `$${v.toFixed(2)}`;
+    }
+
+    // Color the remaining-credit figure: red when nearly empty, amber when low,
+    // green otherwise.
+    _creditColor(remaining) {
+        if (remaining < 1) return '#f44336';
+        if (remaining < 5) return '#ff9800';
+        return '#4caf50';
+    }
+
+    // Build a daily-spend histogram from the OpenRouter activity series
+    // ([{ date, spend }]). One bar per day; bar height ∝ spend, Y axis scaled
+    // to the busiest day. Returns null if there's nothing worth drawing.
+    _buildSpendChart(activity) {
+        if (!Array.isArray(activity) || activity.length === 0) return null;
+
+        const points = activity.slice(-SPARKLINE_POINTS);
+        const total = points.reduce((s, p) => s + p.spend, 0);
+        const maxSpend = points.reduce((m, p) => Math.max(m, p.spend), 0);
+        // All-zero spend over the window: nothing meaningful to chart.
+        if (maxSpend <= 0) return null;
+
+        const container = new St.BoxLayout({
+            vertical: true,
+            style_class: 'onwatch-spark-row',
+        });
+
+        // Title + total over the window.
+        const header = new St.BoxLayout();
+        header.add_child(new St.Label({
+            text: 'Dépense OpenRouter',
+            style_class: 'onwatch-quota-label',
+            x_expand: true,
+        }));
+        header.add_child(new St.Label({
+            text: this._formatUsd(total),
+            style: 'color: rgb(33,150,243); font-size: 10px; font-weight: bold;',
+        }));
+        container.add_child(header);
+
+        const HEIGHT = 56;
+        const PAD_L = 32;   // left gutter for the Y-axis (max $) label
+        const PAD_TB = 4;   // top/bottom padding inside the plot
+        const area = new St.DrawingArea({
+            style_class: 'onwatch-spark-area',
+            x_expand: true,
+        });
+        area.height = HEIGHT;
+
+        area.connect('repaint', (a) => {
+            const [w, h] = a.get_surface_size();
+            const cr = a.get_context();
+            const n = points.length;
+            const plotW = w - PAD_L;
+            const plotH = h - PAD_TB * 2;
+
+            // Baseline gridline at the bottom.
+            cr.setLineWidth(1);
+            cr.setSourceRGBA(1, 1, 1, 0.10);
+            cr.moveTo(PAD_L, h - PAD_TB);
+            cr.lineTo(w, h - PAD_TB);
+            cr.stroke();
+
+            // Bars: leave a 1px gap between adjacent days so they read as
+            // discrete columns even when the window is full.
+            const slot = n > 0 ? plotW / n : plotW;
+            const barW = Math.max(1, slot - 1);
+            cr.setSourceRGBA(0.13, 0.59, 0.95, 0.85); // blue, matches the total
+            for (let i = 0; i < n; i++) {
+                const spend = points[i].spend;
+                if (spend <= 0) continue;
+                const barH = (spend / maxSpend) * plotH;
+                const x = PAD_L + i * slot;
+                cr.rectangle(x, h - PAD_TB - barH, barW, barH);
+                cr.fill();
+            }
+            cr.$dispose();
+        });
+
+        // Y-axis max-spend label overlaid on the left gutter.
+        const axisOverlay = new St.Widget({
+            layout_manager: new Clutter.BinLayout(),
+            x_expand: true,
+        });
+        axisOverlay.add_child(area);
+        const maxLbl = new St.Label({
+            text: this._formatUsd(maxSpend),
+            style: 'font-size: 9px; color: #888;',
+        });
+        maxLbl.set_position(0, 2);
+        axisOverlay.add_child(maxLbl);
+        container.add_child(axisOverlay);
+
+        // Time-range label (oldest day → today).
+        const oldest = points[0]?.date;
+        if (oldest) {
+            container.add_child(new St.Label({
+                text: `${oldest} → aujourd'hui  ·  ${points.length}j`,
+                style: 'font-size: 9px; color: #888; margin-top: 2px;',
+            }));
+        }
+
+        return container;
     }
 
     _statusColor(status) {

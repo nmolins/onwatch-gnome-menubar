@@ -36,6 +36,12 @@
   /* Color is applied inline via a continuous gradient (see extension.js). */
 }
 
+.onwatch-credit-row {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
 .onwatch-spark-row {
   margin-top: 10px;
 }
